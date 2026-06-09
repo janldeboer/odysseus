@@ -247,8 +247,10 @@ def test_chat_messages_fts_migration_backfills_and_tracks_inserts(tmp_path, monk
     conn.close()
 
     monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db_path}")
-
-    cdb._migrate_chat_messages_fts()
+    from core import migrations
+    monkeypatch.setattr(migrations, "DATABASE_URL", f"sqlite:///{db_path}")
+    _migrate_chat_messages_fts = migrations._migrate_chat_messages_fts
+    _migrate_chat_messages_fts()
 
     conn = sqlite3.connect(db_path)
     try:
