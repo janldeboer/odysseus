@@ -38,6 +38,7 @@ caldav
 cryptography
 bcrypt
 mcp
+fastmcp>=2.4
 pyotp
 qrcode[pil]
 croniter

@@ -128,18 +128,118 @@ def mcp_tool_is_readonly(tool: Dict) -> bool:
     return name.startswith(_MCP_READONLY_VERBS)
 
 
+def _identity_hints_from_env(env: Optional[Dict[str, str]]) -> str:
+    """Pull identity labels (email, username, account) out of stdio env vars.
+
+    Used to disambiguate multiple instances of the same MCP server (e.g. two
+    email accounts) in tool descriptions and status UI.
+    """
+    if not env:
+        return ""
+    hints = []
+    for k, v in env.items():
+        k_lower = k.lower()
+        if any(x in k_lower for x in ('email_address', 'account', 'user', 'username')):
+            hints.append(v)
+    return ", ".join(h for h in hints if h)
+
+
+def _tool_to_spec(tool: Any) -> Dict[str, Any]:
+    """Convert a fastmcp/MCP Tool object into our internal tool-schema dict.
+
+    The shape is what the agent loop, admin routes, and prompt-cache code
+    already consume: {name, description, input_schema, annotations}.
+    """
+    return {
+        "name": tool.name,
+        "description": tool.description or "",
+        "input_schema": getattr(tool, "inputSchema", None) or getattr(tool, "input_schema", None) or {},
+        "annotations": getattr(tool, "annotations", None),
+    }
+
+
+def _transport_for(transport: str, *, command: Optional[str], args: Optional[List[str]],
+                   env: Optional[Dict[str, str]], url: Optional[str],
+                   auth: Optional[Any] = None) -> Any:
+    """Build the right fastmcp transport for the given MCP server config.
+
+    All stdio servers get a fresh subprocess per connect (keep_alive=False) so
+    disconnect/reconnect semantics match the previous AsyncExitStack lifecycle
+    exactly — a closed client is a dead subprocess, no shared state.
+    """
+    if transport == "stdio":
+        from fastmcp.client.transports import StdioTransport
+        return StdioTransport(
+            command=command or "",
+            args=list(args or []),
+            env={**os.environ, **(env or {})} if env else None,
+            keep_alive=False,
+        )
+    if transport == "sse":
+        from fastmcp.client.transports import SSETransport
+        return SSETransport(url=url or "", auth=auth)
+    if transport == "http":
+        from fastmcp.client.transports import StreamableHttpTransport
+        return StreamableHttpTransport(url=url or "", auth=auth)
+    raise ValueError(f"Unknown MCP transport: {transport}")
+
+
+def _result_to_dict(result: Any) -> Dict[str, Any]:
+    """Convert a fastmcp CallToolResult into the {stdout, stderr, exit_code, images}
+    dict every call site (agent_loop, tool_execution, task_scheduler) expects.
+
+    Mirrors the old _do_call behavior, with one addition: structured_content is
+    JSON-encoded into stdout when no text content blocks are present, so
+    FastMCP-style structured outputs reach the agent unchanged.
+    """
+    output_parts: List[str] = []
+    images: List[Dict[str, Any]] = []
+    for content in (result.content or []):
+        ctype = getattr(content, "type", "")
+        if ctype == "text" and hasattr(content, "text"):
+            output_parts.append(content.text)
+        elif ctype == "image" and hasattr(content, "data"):
+            mime = getattr(content, "mimeType", None) or getattr(content, "mime_type", None) or "image/png"
+            images.append({"data": content.data, "mimeType": mime})
+            output_parts.append(f"[Screenshot captured ({mime})]")
+        elif hasattr(content, "data"):
+            output_parts.append(str(content.data))
+
+    is_error = bool(getattr(result, "is_error", False) or getattr(result, "isError", False))
+    if not output_parts and not is_error:
+        structured = getattr(result, "structured_content", None)
+        if structured:
+            output_parts.append(json.dumps(structured))
+        elif getattr(result, "data", None) is not None:
+            output_parts.append(str(result.data))
+
+    output = "\n".join(output_parts)
+    result_dict: Dict[str, Any] = {
+        "stdout": "" if is_error else output,
+        "stderr": output if is_error else "",
+        "exit_code": 1 if is_error else 0,
+    }
+    if images:
+        result_dict["images"] = images
+    return result_dict
+
+
 class McpManager:
-    """Manages MCP server connections and tool routing."""
+    """Manages MCP server connections and tool routing.
+
+    Connection lifecycle is delegated to fastmcp.Client; we keep the same
+    public surface (connect_server / call_tool / get_all_tools / etc.) so
+    callers across agent_loop, tool_execution, task_scheduler, routes, and
+    builtin_mcp don't have to change.
+    """
 
     def __init__(self):
-        # server_id -> connection state
+        # server_id -> connection state dict (status, name, transport, tool_count, identity, auth_url, error)
         self._connections: Dict[str, Dict[str, Any]] = {}
-        # server_id -> list of tool schemas
-        self._tools: Dict[str, List[Dict]] = {}
-        # server_id -> MCP ClientSession
-        self._sessions: Dict[str, Any] = {}
-        # server_id -> exit stack (for cleanup)
-        self._stacks: Dict[str, Any] = {}
+        # server_id -> list of tool schemas (same shape as before: {name, description, input_schema, annotations})
+        self._tools: Dict[str, List[Dict[str, Any]]] = {}
+        # server_id -> fastmcp.Client (entered/active) or None if disconnected
+        self._clients: Dict[str, Any] = {}
         # server_id -> background connect task (HTTP transport / OAuth)
         self._connect_tasks: Dict[str, Any] = {}
         # Tracking updates to tools/connections for RAG indexing / prompt cache
@@ -176,122 +276,82 @@ class McpManager:
             self._generation += 1
             return False
 
+    async def _open_client(self, transport: str, *, server_id: str, name: str,
+                           command: Optional[str] = None, args: Optional[List[str]] = None,
+                           env: Optional[Dict[str, str]] = None, url: Optional[str] = None,
+                           auth: Optional[Any] = None) -> Optional[Tuple[Any, List[Dict[str, Any]]]]:
+        """Open a fastmcp.Client, run initialize + list_tools, return (client, tools).
+
+        Returns None and publishes an 'error' status if anything goes wrong
+        (caller checks _connections[server_id] to surface the message). On
+        failure we also bump _generation so any cached tool prompt is
+        invalidated — a failed connect is a structural state change.
+        """
+        try:
+            from fastmcp import Client
+        except ImportError:
+            self._connections[server_id] = {"status": "error", "error": "fastmcp not installed", "name": name}
+            self._generation += 1
+            return None
+
+        client = Client(
+            _transport_for(transport, command=command, args=args, env=env, url=url, auth=auth),
+            auto_initialize=True,
+        )
+        try:
+            await client.__aenter__()
+        except Exception as e:
+            self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
+            self._generation += 1
+            return None
+        try:
+            tools_raw = await client.list_tools()
+        except Exception as e:
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
+            self._generation += 1
+            return None
+        return client, [_tool_to_spec(t) for t in tools_raw]
+
     async def _connect_stdio(self, server_id: str, name: str, command: str, args: List[str], env: Dict[str, str]) -> bool:
         """Connect to an MCP server via stdio transport."""
-        try:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
-            from contextlib import AsyncExitStack
-
-            server_params = StdioServerParameters(
-                command=command,
-                args=args,
-                env={**os.environ, **env} if env else None,
-            )
-
-            stack = AsyncExitStack()
-            try:
-                transport = await stack.enter_async_context(stdio_client(server_params))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-
-                await session.initialize()
-
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
-            tools = []
-            for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-                    # MCP tool annotations (readOnlyHint / destructiveHint) drive
-                    # plan-mode read-only gating. Absent on many servers, so we
-                    # fall back to a name heuristic in mcp_tool_is_readonly().
-                    "annotations": getattr(tool, 'annotations', None),
-                })
-
-            self._sessions[server_id] = session
-            self._stacks[server_id] = stack
-            self._tools[server_id] = tools
-            # Extract identity hints from env vars (e.g. email address, API name)
-            # so tool descriptions can distinguish between multiple instances of
-            # the same MCP server (e.g. two email accounts).
-            identity_hints = []
-            for k, v in (env or {}).items():
-                k_lower = k.lower()
-                if any(x in k_lower for x in ['email_address', 'account', 'user', 'username']):
-                    identity_hints.append(v)
-            identity = ", ".join(identity_hints) if identity_hints else ""
-
-            self._connections[server_id] = {
-                "status": "connected",
-                "name": name,
-                "transport": "stdio",
-                "tool_count": len(tools),
-                "identity": identity,
-            }
-
-            logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via stdio")
-            return True
-
-        except ImportError:
-            logger.warning("MCP package not installed. Install with: pip install mcp")
-            self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
+        result = await self._open_client(
+            "stdio", server_id=server_id, name=name, command=command, args=args, env=env,
+        )
+        if result is None:
             return False
+        client, tools = result
+        self._clients[server_id] = client
+        self._tools[server_id] = tools
+        self._connections[server_id] = {
+            "status": "connected",
+            "name": name,
+            "transport": "stdio",
+            "tool_count": len(tools),
+            "identity": _identity_hints_from_env(env),
+        }
+        logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via stdio")
+        return True
 
     async def _connect_sse(self, server_id: str, name: str, url: str) -> bool:
         """Connect to an MCP server via SSE transport."""
-        try:
-            from mcp import ClientSession
-            from mcp.client.sse import sse_client
-            from contextlib import AsyncExitStack
-
-            stack = AsyncExitStack()
-            try:
-                transport = await stack.enter_async_context(sse_client(url))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-
-                await session.initialize()
-
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
-            tools = []
-            for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-                    # MCP tool annotations (readOnlyHint / destructiveHint) drive
-                    # plan-mode read-only gating. Absent on many servers, so we
-                    # fall back to a name heuristic in mcp_tool_is_readonly().
-                    "annotations": getattr(tool, 'annotations', None),
-                })
-
-            self._sessions[server_id] = session
-            self._stacks[server_id] = stack
-            self._tools[server_id] = tools
-            self._connections[server_id] = {
-                "status": "connected",
-                "name": name,
-                "transport": "sse",
-                "tool_count": len(tools),
-            }
-
-            logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via SSE")
-            return True
-
-        except ImportError:
-            logger.warning("MCP package not installed. Install with: pip install mcp")
-            self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
+        result = await self._open_client("sse", server_id=server_id, name=name, url=url)
+        if result is None:
             return False
+        client, tools = result
+        self._clients[server_id] = client
+        self._tools[server_id] = tools
+        self._connections[server_id] = {
+            "status": "connected",
+            "name": name,
+            "transport": "sse",
+            "tool_count": len(tools),
+        }
+        logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via SSE")
+        return True
 
     async def _start_http_connect(self, server_id: str, name: str, url: str, wait: float = 8.0) -> bool:
         """Begin a Streamable HTTP connect in the background. Returns within
@@ -322,58 +382,39 @@ class McpManager:
 
     async def _connect_http(self, server_id: str, name: str, url: str) -> bool:
         """Connect to a Streamable HTTP MCP server (with automatic OAuth)."""
-        try:
-            from mcp import ClientSession
-            from mcp.client.streamable_http import streamablehttp_client
-            from contextlib import AsyncExitStack
-            from src.mcp_oauth import build_provider, clear_auth_url
+        from src.mcp_oauth import build_provider, clear_auth_url
 
-            def _on_redirect(auth_url):
-                # Publish needs_auth the moment the URL is known, independent of
-                # how long discovery/DCR took (may exceed the bounded start wait).
-                self._connections[server_id] = {
-                    "status": "needs_auth", "name": name, "transport": "http",
-                    "auth_url": auth_url,
-                }
-
-            provider = build_provider(server_id, url, on_redirect=_on_redirect)
-            stack = AsyncExitStack()
-            transport = await stack.enter_async_context(streamablehttp_client(url, auth=provider))
-            read_stream, write_stream, _get_session_id = transport
-            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-            await session.initialize()
-
-            tools_result = await session.list_tools()
-            tools = []
-            for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-                })
-
-            self._sessions[server_id] = session
-            self._stacks[server_id] = stack
-            self._tools[server_id] = tools
+        def _on_redirect(auth_url):
+            # Publish needs_auth the moment the URL is known, independent of
+            # how long discovery/DCR took (may exceed the bounded start wait).
             self._connections[server_id] = {
-                "status": "connected", "name": name, "transport": "http",
-                "tool_count": len(tools),
+                "status": "needs_auth", "name": name, "transport": "http",
+                "auth_url": auth_url,
             }
-            clear_auth_url(server_id)
-            # Tools changed (this can complete after connect_server already
-            # returned, via the background OAuth flow), so bump the generation
-            # to invalidate the tool-prompt cache.
-            self._generation += 1
-            logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via http")
-            return True
+
+        try:
+            provider = build_provider(server_id, url, on_redirect=_on_redirect)
         except ImportError:
-            logger.warning("MCP package not installed. Install with: pip install mcp")
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
             return False
-        except Exception as e:
-            logger.error(f"Failed to connect HTTP MCP server {name} ({server_id}): {e}")
-            self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
+
+        result = await self._open_client("http", server_id=server_id, name=name, url=url, auth=provider)
+        if result is None:
             return False
+        client, tools = result
+        self._clients[server_id] = client
+        self._tools[server_id] = tools
+        self._connections[server_id] = {
+            "status": "connected", "name": name, "transport": "http",
+            "tool_count": len(tools),
+        }
+        clear_auth_url(server_id)
+        # Tools changed (this can complete after connect_server already
+        # returned, via the background OAuth flow), so bump the generation
+        # to invalidate the tool-prompt cache.
+        self._generation += 1
+        logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via http")
+        return True
 
     async def disconnect_server(self, server_id: str):
         """Disconnect from an MCP server."""
@@ -388,14 +429,13 @@ class McpManager:
         except Exception:
             pass
 
-        stack = self._stacks.pop(server_id, None)
-        if stack:
+        client = self._clients.pop(server_id, None)
+        if client is not None:
             try:
-                await stack.aclose()
+                await client.__aexit__(None, None, None)
             except Exception as e:
                 logger.warning(f"Error closing MCP server {server_id}: {e}")
 
-        self._sessions.pop(server_id, None)
         self._tools.pop(server_id, None)
         self._connections.pop(server_id, None)
         self._generation += 1
@@ -403,7 +443,7 @@ class McpManager:
 
     async def disconnect_all(self):
         """Disconnect from all MCP servers."""
-        ids = list(self._sessions.keys())
+        ids = list(self._clients.keys())
         for sid in ids:
             await self.disconnect_server(sid)
 
@@ -441,27 +481,27 @@ class McpManager:
         server_id = parts[1]
         tool_name = parts[2]
 
-        session = self._sessions.get(server_id)
-        if not session:
+        client = self._clients.get(server_id)
+        if not client:
             return {"error": f"MCP server not connected: {server_id}", "exit_code": 1}
 
         try:
-            result = await self._do_call(session, tool_name, arguments)
+            result = await client.call_tool(tool_name, arguments or {})
         except Exception as e:
             # Auto-reconnect for builtin servers whose subprocess may have died
             if self.is_builtin(server_id):
                 logger.warning(f"MCP call failed for {qualified_name}, attempting reconnect: {e}")
                 reconnected = await self._reconnect_builtin(server_id)
                 if reconnected:
-                    session = self._sessions.get(server_id)
-                    if session:
+                    client = self._clients.get(server_id)
+                    if client:
                         try:
-                            result = await self._do_call(session, tool_name, arguments)
+                            result = await client.call_tool(tool_name, arguments or {})
                         except Exception as e2:
                             logger.error(f"MCP tool call failed after reconnect: {qualified_name}: {e2}")
                             return {"error": str(e2), "exit_code": 1}
                     else:
-                        return {"error": f"Reconnected but no session for {server_id}", "exit_code": 1}
+                        return {"error": f"Reconnected but no client for {server_id}", "exit_code": 1}
                 else:
                     logger.error(f"MCP reconnect failed for {server_id}")
                     return {"error": f"MCP server crashed and reconnect failed: {server_id}", "exit_code": 1}
@@ -469,35 +509,11 @@ class McpManager:
                 logger.error(f"MCP tool call failed: {qualified_name}: {e}")
                 return {"error": str(e), "exit_code": 1}
 
-        return result
-
-    async def _do_call(self, session, tool_name: str, arguments: Dict) -> Dict:
-        """Execute a single MCP tool call and return result dict."""
-        result = await session.call_tool(tool_name, arguments)
-        output_parts = []
-        images = []
-        for content in result.content:
-            if hasattr(content, 'text'):
-                output_parts.append(content.text)
-            elif getattr(content, 'type', '') == 'image' and hasattr(content, 'data'):
-                # Image content (e.g. Playwright screenshots)
-                mime = getattr(content, 'mimeType', 'image/png')
-                images.append({"data": content.data, "mimeType": mime})
-                output_parts.append(f"[Screenshot captured ({mime})]")
-            elif hasattr(content, 'data'):
-                output_parts.append(str(content.data))
-
-        output = "\n".join(output_parts)
-        is_error = getattr(result, 'isError', False)
-
-        result_dict = {
-            "stdout": output if not is_error else "",
-            "stderr": output if is_error else "",
-            "exit_code": 1 if is_error else 0,
-        }
-        if images:
-            result_dict["images"] = images
-        return result_dict
+        try:
+            return _result_to_dict(result)
+        except Exception as e:
+            logger.error(f"MCP result conversion failed: {qualified_name}: {e}")
+            return {"error": f"Bad MCP result: {e}", "exit_code": 1}
 
     async def _reconnect_builtin(self, server_id: str) -> bool:
         """Tear down and reconnect a crashed builtin MCP server."""
